@@ -512,13 +512,13 @@ def summarize_results(dirname, stats_languages=None, verbose=True):
     lang_to_stats = {}
     for lang, results in lang_to_results.items():
         lang_stats = SimpleNamespace()
+        lang_stats.completed_tests = 0
+        lang_stats.duration = 0
+        lang_stats.cost = 0
         for i in range(tries):
             setattr(lang_stats, f"pass_rate_{i}", 0)
         for i in range(tries):
             setattr(lang_stats, f"pass_num_{i}", 0)
-        lang_stats.completed_tests = 0
-        lang_stats.duration = 0
-        lang_stats.cost = 0
         lang_stats.error_outputs = 0
         lang_stats.user_asks = 0
         lang_stats.test_timeouts = 0
