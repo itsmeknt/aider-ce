@@ -471,7 +471,7 @@ def show_diffs(dirnames):
 
 def load_results(dirname, stats_languages=None):
     dirname = Path(dirname)
-    all_results = []
+    lang_to_results = {}
 
     if stats_languages:
         languages = [lang.strip().lower() for lang in stats_languages.split(",")]
@@ -484,21 +484,23 @@ def load_results(dirname, stats_languages=None):
             try:
                 with open(fname, "r", encoding="utf-8", errors="replace") as f:
                     results = json.load(f)
-                all_results.append(results)
+                #      json / test / prac / exer / lang
+                lang = fname.parent.parent.parent.parent.name
+                lang_to_results.setdefault(lang, []).append(results)
             except json.JSONDecodeError:
                 print("json.JSONDecodeError", fname)
                 continue
-    return all_results
+    return lang_to_results
 
 
 def summarize_results(dirname, stats_languages=None):
-    all_results = load_results(dirname, stats_languages)
+    lang_to_results = load_results(dirname, stats_languages)
 
     res = SimpleNamespace()
     res.total_tests = len(list(Path(dirname).glob("*/exercises/practice/*")))
 
     try:
-        tries = max(len(results.get("tests_outcomes", [])) for results in all_results if results)
+        tries = max(len(results.get("tests_outcomes", [])) for results_list in lang_to_results.values() for results in results_list if results)
     except ValueError:
         tries = 0
 
@@ -526,43 +528,77 @@ def summarize_results(dirname, stats_languages=None):
     res.map_tokens = None
     variants = defaultdict(set)
 
-    for results in all_results:
-        if not results:
-            continue
+    def add(attr_name, increment, global_stats, lang_stats):
+        global_prev = getattr(global_stats, attr_name)
+        setattr(global_stats, attr_name, global_prev + increment)
 
-        res.completed_tests += 1
-        tests_outcomes = results.get("tests_outcomes", [])
-        passed = tests_outcomes and tests_outcomes[-1]
-        if passed:
-            for i in range(len(tests_outcomes) - 1, tries):
-                passed_tests[i] += 1
+        lang_prev = getattr(lang_stats, attr_name)
+        setattr(lang_stats, attr_name, lang_prev + increment)
 
-        res.cost += results.get("cost", 0)
-        res.duration += results.get("duration", 0)
-        res.test_timeouts += results.get("test_timeouts", 0)
+        
+    lang_to_stats = {}
+    lang_to_passed_tests = {}
+    for lang, results_list in lang_to_results.items():
+        lang_stats = SimpleNamespace()
+        lang_stats.completed_tests = 0
+        lang_stats.duration = 0
+        lang_stats.cost = 0
+        for i in range(tries):
+            setattr(lang_stats, f"pass_rate_{i}", 0)
+        for i in range(tries):
+            setattr(lang_stats, f"pass_num_{i}", 0)
+        lang_stats.error_outputs = 0
+        lang_stats.user_asks = 0
+        lang_stats.test_timeouts = 0
+        lang_stats.exhausted_context_windows = 0
+        lang_stats.num_malformed_responses = 0
+        lang_stats.num_with_malformed_responses = 0
+        lang_stats.syntax_errors = 0
+        lang_stats.indentation_errors = 0
+        lang_stats.lazy_comments = 0
+        lang_stats.prompt_tokens = 0
+        lang_stats.completion_tokens = 0
+        lang_to_stats[lang] = lang_stats
+        lang_to_passed_tests[lang] = [0] * tries
+            
+        for results in results_list:
+            if not results:
+                continue
 
-        res.error_outputs += results.get("num_error_outputs", 0)
-        res.user_asks += results.get("num_user_asks", 0)
-        res.exhausted_context_windows += results.get("num_exhausted_context_windows", 0)
-        res.num_malformed_responses += results.get("num_malformed_responses", 0)
-        if results.get("num_malformed_responses"):
-            res.num_with_malformed_responses += 1
-        res.lazy_comments += results.get("lazy_comments", 0)
+            add("completed_tests", 1, res, lang_stats)
+            tests_outcomes = results.get("tests_outcomes", [])
+            passed = tests_outcomes and tests_outcomes[-1]
+            if passed:
+                for i in range(len(tests_outcomes) - 1, tries):
+                    passed_tests[i] += 1
+                    lang_to_passed_tests[lang][i] += 1
 
-        res.syntax_errors += results.get("syntax_errors", 0)
-        res.indentation_errors += results.get("indentation_errors", 0)
+            add("cost", results.get("cost", 0), res, lang_stats)
+            add("duration", results.get("duration", 0), res, lang_stats)
+            add("test_timeouts", results.get("test_timeouts", 0), res, lang_stats)
 
-        res.prompt_tokens += results.get("prompt_tokens", 0)
-        res.completion_tokens += results.get("completion_tokens", 0)
+            add("error_outputs", results.get("num_error_outputs", 0), res, lang_stats)
+            add("user_asks", results.get("num_user_asks", 0), res, lang_stats)
+            add("exhausted_context_windows", results.get("num_exhausted_context_windows", 0), res, lang_stats)
+            add("num_malformed_responses", results.get("num_malformed_responses", 0), res, lang_stats)
+            if results.get("num_malformed_responses"):
+                add("num_with_malformed_responses", 1, res, lang_stats)
+            add("lazy_comments", results.get("lazy_comments", 0), res, lang_stats)
 
-        res.reasoning_effort = results.get("reasoning_effort")
-        res.thinking_tokens = results.get("thinking_tokens")
-        res.map_tokens = results.get("map_tokens")
+            add("syntax_errors", results.get("syntax_errors", 0), res, lang_stats)
+            add("indentation_errors", results.get("indentation_errors", 0), res, lang_stats)
 
-        for key in "model edit_format commit_hash editor_model editor_edit_format".split():
-            val = results.get(key)
-            if val:
-                variants[key].add(val)
+            add("prompt_tokens", results.get("prompt_tokens", 0), res, lang_stats)
+            add("completion_tokens", results.get("completion_tokens", 0), res, lang_stats)
+
+            res.reasoning_effort = results.get("reasoning_effort")
+            res.thinking_tokens = results.get("thinking_tokens")
+            res.map_tokens = results.get("map_tokens")
+
+            for key in "model edit_format commit_hash editor_model editor_edit_format".split():
+                val = results.get(key)
+                if val:
+                    variants[key].add(val)
 
     if not res.completed_tests:
         return
@@ -653,6 +689,74 @@ def summarize_results(dirname, stats_languages=None):
         f" ${projected_cost:.2f} projected"
     )
 
+    if len(lang_to_stats) > 0:
+        print()
+        print("======== Stats by language ========")
+        print()
+        
+        langs = list(lang_to_stats.keys())
+        lang_to_col_widths = {}
+        for lang in langs:
+            lang_stats = lang_to_stats[lang]
+
+            # Postprocess attributes for easier printing
+            for i in range(tries):
+                num_passed = lang_to_passed_tests[lang][i]
+                setattr(lang_stats, f"pass_num_{i}", num_passed)
+                pass_rate = 100 * num_passed / float(lang_stats.completed_tests)
+                setattr(lang_stats, f"pass_rate_{i}", pass_rate)
+
+            for attr in lang_stats.__dict__:
+                val = getattr(lang_stats, attr)
+                if val == 0:
+                    val = "-"
+                elif isinstance(val, float):
+                    val = f"{val:,.2f}"
+                else:
+                    val = f"{val:,}"
+
+                setattr(lang_stats, attr, val)
+            
+            lang_col_width = max(len(lang), len(max([getattr(lang_stats, attr) for attr in lang_stats.__dict__], key=len)))
+            lang_to_col_widths[lang] = lang_col_width
+
+        any_stats = list(lang_to_stats.values())[0]
+        attrs = list(any_stats.__dict__)
+        attr_col_width = len(max(["language"] + attrs, key=len))
+        
+        print("| " + ("-" * attr_col_width), end="")
+        for lang in langs:
+            col_width = lang_to_col_widths[lang]
+            print(" | " + ("-" * col_width), end="")
+        print(" |")
+        
+        print(f"| {' '.center(attr_col_width)}", end="")
+        for lang in langs:
+            col_width = lang_to_col_widths[lang]
+            print(f" | {lang.center(col_width)}", end="")
+        print(" |")
+        
+        print("| " + ("-" * attr_col_width), end="")
+        for lang in langs:
+            col_width = lang_to_col_widths[lang]
+            print(" | " + ("-" * col_width), end="")
+        print(" |")
+
+        for attr in attrs:
+            print(f"| {attr:<{attr_col_width}}", end="")
+            for lang in langs:
+                lang_stats = lang_to_stats[lang]
+                col_width = lang_to_col_widths[lang]
+                print(f" | {getattr(lang_stats, attr):>{col_width}}", end="")
+            print(" |")
+            
+        print("| " + ("-" * attr_col_width), end="")
+        for lang in langs:
+            col_width = lang_to_col_widths[lang]
+            print(" | " + ("-" * col_width), end="")
+        print(" |")
+        print()
+        
     console.rule()
 
     # print(json.dumps(vars(res), indent=4, sort_keys=True))
