@@ -542,6 +542,7 @@ def summarize_results(dirname, stats_languages=None):
         lang_stats = SimpleNamespace()
         lang_stats.completed_tests = 0
         lang_stats.duration = 0
+        lang_stats.avg_duration_per_test = 0
         lang_stats.cost = 0
         for i in range(tries):
             setattr(lang_stats, f"pass_rate_{i}", 0)
@@ -700,6 +701,8 @@ def summarize_results(dirname, stats_languages=None):
             lang_stats = lang_to_stats[lang]
 
             # Postprocess attributes for easier printing
+            if lang_stats.completed_tests > 0:
+                lang_stats.avg_duration_per_test = lang_stats.duration / float(lang_stats.completed_tests)
             for i in range(tries):
                 num_passed = lang_to_passed_tests[lang][i]
                 setattr(lang_stats, f"pass_num_{i}", num_passed)
