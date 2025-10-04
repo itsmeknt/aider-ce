@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from collections.abc import Iterable
+import copy
 import datetime
 import json
 import os
@@ -6,6 +8,7 @@ import random
 import re
 import shutil
 import subprocess
+import statistics
 import sys
 import time
 import traceback
@@ -13,7 +16,7 @@ from collections import defaultdict
 from json.decoder import JSONDecodeError
 from pathlib import Path
 from types import SimpleNamespace
-from typing import List, Optional
+from typing import Any, List, Optional
 
 """
 Performance-oriented refactors:
@@ -95,8 +98,8 @@ def find_latest_benchmark_dir():
 def show_stats(dirnames, graphs, verbose, stats_languages=None):
     raw_rows = []
     for dirname in dirnames:
-        row = summarize_results(dirname, verbose, stats_languages)
-        raw_rows.append(row)
+        rows = summarize_results(dirname, verbose, stats_languages)
+        raw_rows.extend(rows)
 
     # return
 
@@ -471,255 +474,325 @@ def show_diffs(dirnames):
 
 def load_results(dirname, stats_languages=None):
     dirname = Path(dirname)
-    lang_to_results = {}
+    run_to_lang_to_results = {}
 
     if stats_languages:
         languages = [lang.strip().lower() for lang in stats_languages.split(",")]
         glob_patterns = [f"{lang}/exercises/practice/*/.aider.results.json" for lang in languages]
     else:
-        glob_patterns = ["*/exercises/practice/*/.aider.results.json"]
+        glob_patterns = ["**/exercises/practice/*/.aider.results.json"]
 
+    # Check if this is a single-run --stats
     for pattern in glob_patterns:
         for fname in dirname.glob(pattern):
             try:
                 results = json.loads(fname.read_text())
                 #      json / test / prac / exer / lang
                 lang = fname.parent.parent.parent.parent.name
-                lang_to_results.setdefault(lang, []).append(results)
+                run =  fname.parent.parent.parent.parent.parent.relative_to(dirname)
+                run_to_lang_to_results.setdefault(run, {}).setdefault(lang, []).append(results)
             except json.JSONDecodeError:
                 print("json.JSONDecodeError", fname)
                 continue
-    return lang_to_results
+            
+    return run_to_lang_to_results
 
 
 def summarize_results(dirname, verbose, stats_languages=None):
-    lang_to_results = load_results(dirname, stats_languages)
-
-    res = SimpleNamespace()
-    res.total_tests = len(list(Path(dirname).glob("*/exercises/practice/*")))
-
-    try:
-        tries = max(
-            len(results.get("tests_outcomes", []))
-            for results_list in lang_to_results.values()
-            for results in results_list
-            if results
-        )
-    except ValueError:
-        tries = 0
-
-    res.dir_name = str(dirname)
-
-    passed_tests = [0] * tries
-
-    res.completed_tests = 0
-    res.duration = 0
-    res.cost = 0
-    res.error_outputs = 0
-    res.user_asks = 0
-    res.test_timeouts = 0
-    res.exhausted_context_windows = 0
-    res.num_malformed_responses = 0
-    res.num_with_malformed_responses = 0
-    res.syntax_errors = 0
-    res.indentation_errors = 0
-    res.lazy_comments = 0
-    res.prompt_tokens = 0
-    res.completion_tokens = 0
-
-    res.reasoning_effort = None
-    res.thinking_tokens = None
-    res.map_tokens = None
-    variants = defaultdict(set)
-
     def add(attr_name, increment, global_stats, lang_stats):
         global_prev = getattr(global_stats, attr_name)
         setattr(global_stats, attr_name, global_prev + increment)
 
         lang_prev = getattr(lang_stats, attr_name)
         setattr(lang_stats, attr_name, lang_prev + increment)
+            
+    run_to_lang_to_results = load_results(dirname, stats_languages)
 
-    lang_to_stats = {}
-    lang_to_passed_tests = {}
-    for lang, results_list in lang_to_results.items():
-        lang_stats = SimpleNamespace()
-        lang_stats.completed_tests = 0
-        lang_stats.duration = 0
-        lang_stats.avg_duration_per_test = 0
-        lang_stats.cost = 0
-        for i in range(tries):
-            setattr(lang_stats, f"pass_rate_{i + 1}", 0)
-        for i in range(tries):
-            setattr(lang_stats, f"pass_num_{i + 1}", 0)
-        lang_stats.error_outputs = 0
-        lang_stats.user_asks = 0
-        lang_stats.test_timeouts = 0
-        lang_stats.exhausted_context_windows = 0
-        lang_stats.num_malformed_responses = 0
-        lang_stats.num_with_malformed_responses = 0
-        lang_stats.syntax_errors = 0
-        lang_stats.indentation_errors = 0
-        lang_stats.lazy_comments = 0
-        lang_stats.prompt_tokens = 0
-        lang_stats.completion_tokens = 0
-        lang_to_stats[lang] = lang_stats
-        lang_to_passed_tests[lang] = [0] * tries
 
-        for results in results_list:
-            if not results:
-                continue
-
-            add("completed_tests", 1, res, lang_stats)
-            tests_outcomes = results.get("tests_outcomes", [])
-            passed = tests_outcomes and tests_outcomes[-1]
-            if passed:
-                for i in range(len(tests_outcomes) - 1, tries):
-                    passed_tests[i] += 1
-                    lang_to_passed_tests[lang][i] += 1
-
-            add("cost", results.get("cost", 0), res, lang_stats)
-            add("duration", results.get("duration", 0), res, lang_stats)
-            add("test_timeouts", results.get("test_timeouts", 0), res, lang_stats)
-
-            add("error_outputs", results.get("num_error_outputs", 0), res, lang_stats)
-            add("user_asks", results.get("num_user_asks", 0), res, lang_stats)
-            add(
-                "exhausted_context_windows",
-                results.get("num_exhausted_context_windows", 0),
-                res,
-                lang_stats,
+    max_tries = 0
+    run_to_res = {}
+    lang_to_run_to_stats = {}
+    for run, lang_to_results in run_to_lang_to_results.items():
+        res = SimpleNamespace()
+        run_to_res[run] = res
+        
+        res.total_tests = len(list((Path(dirname) / run).glob("*/exercises/practice/*")))
+        
+        try:
+            tries = max(
+                len(results.get("tests_outcomes", []))
+                for results_list in lang_to_results.values()
+                for results in results_list
+                if results
             )
-            add(
-                "num_malformed_responses",
-                results.get("num_malformed_responses", 0),
-                res,
-                lang_stats,
-            )
-            if results.get("num_malformed_responses"):
-                add("num_with_malformed_responses", 1, res, lang_stats)
-            add("lazy_comments", results.get("lazy_comments", 0), res, lang_stats)
+        except ValueError:
+            tries = 0
 
-            add("syntax_errors", results.get("syntax_errors", 0), res, lang_stats)
-            add("indentation_errors", results.get("indentation_errors", 0), res, lang_stats)
+        max_tries = max(tries, max_tries)
+            
+        res.dir_name = str(dirname)
 
-            add("prompt_tokens", results.get("prompt_tokens", 0), res, lang_stats)
-            add("completion_tokens", results.get("completion_tokens", 0), res, lang_stats)
+        res.passed_tests = [0] * tries
 
-            res.reasoning_effort = results.get("reasoning_effort")
-            res.thinking_tokens = results.get("thinking_tokens")
-            res.map_tokens = results.get("map_tokens")
+        res.completed_tests = 0
+        res.duration = 0
+        res.cost = 0
+        res.error_outputs = 0
+        res.user_asks = 0
+        res.test_timeouts = 0
+        res.exhausted_context_windows = 0
+        res.num_malformed_responses = 0
+        res.num_with_malformed_responses = 0
+        res.syntax_errors = 0
+        res.indentation_errors = 0
+        res.lazy_comments = 0
+        res.prompt_tokens = 0
+        res.completion_tokens = 0
 
-            for key in "model edit_format commit_hash editor_model editor_edit_format".split():
-                val = results.get(key)
-                if val:
-                    variants[key].add(val)
+        res.reasoning_effort = None
+        res.thinking_tokens = None
+        res.map_tokens = None
+        res.variants = defaultdict(set)
+        res.versions = set()
+        
+        for lang, results_list in lang_to_results.items():
+            lang_stats = SimpleNamespace()
+            lang_stats.completed_tests = 0
+            lang_stats.duration = 0
+            lang_stats.avg_duration_per_test = 0
+            lang_stats.cost = 0
+            for i in range(tries):
+                setattr(lang_stats, f"pass_rate_{i + 1}", 0)
+            for i in range(tries):
+                setattr(lang_stats, f"pass_num_{i + 1}", 0)
+            lang_stats.error_outputs = 0
+            lang_stats.user_asks = 0
+            lang_stats.test_timeouts = 0
+            lang_stats.exhausted_context_windows = 0
+            lang_stats.num_malformed_responses = 0
+            lang_stats.num_with_malformed_responses = 0
+            lang_stats.syntax_errors = 0
+            lang_stats.indentation_errors = 0
+            lang_stats.lazy_comments = 0
+            lang_stats.prompt_tokens = 0
+            lang_stats.completion_tokens = 0
+            lang_to_run_to_stats.setdefault(lang, {})[run] = lang_stats
+            lang_stats.lang_to_passed_tests = [0] * tries
 
-    if not res.completed_tests:
-        return
+            for results in results_list:
+                if not results:
+                    continue
 
-    # if res.completed_tests < 133:
-    #    return
+                add("completed_tests", 1, res, lang_stats)
+                tests_outcomes = results.get("tests_outcomes", [])
+                passed = tests_outcomes and tests_outcomes[-1]
+                if passed:
+                    for i in range(len(tests_outcomes) - 1, tries):
+                        res.passed_tests[i] += 1
+                        lang_stats.lang_to_passed_tests[i] += 1
 
+                add("cost", results.get("cost", 0), res, lang_stats)
+                add("duration", results.get("duration", 0), res, lang_stats)
+                add("test_timeouts", results.get("test_timeouts", 0), res, lang_stats)
+
+                add("error_outputs", results.get("num_error_outputs", 0), res, lang_stats)
+                add("user_asks", results.get("num_user_asks", 0), res, lang_stats)
+                add(
+                    "exhausted_context_windows",
+                    results.get("num_exhausted_context_windows", 0),
+                    res,
+                    lang_stats,
+                )
+                add(
+                    "num_malformed_responses",
+                    results.get("num_malformed_responses", 0),
+                    res,
+                    lang_stats,
+                )
+                if results.get("num_malformed_responses"):
+                    add("num_with_malformed_responses", 1, res, lang_stats)
+                add("lazy_comments", results.get("lazy_comments", 0), res, lang_stats)
+
+                add("syntax_errors", results.get("syntax_errors", 0), res, lang_stats)
+                add("indentation_errors", results.get("indentation_errors", 0), res, lang_stats)
+
+                add("prompt_tokens", results.get("prompt_tokens", 0), res, lang_stats)
+                add("completion_tokens", results.get("completion_tokens", 0), res, lang_stats)
+
+                res.reasoning_effort = results.get("reasoning_effort")
+                res.thinking_tokens = results.get("thinking_tokens")
+                res.map_tokens = results.get("map_tokens")
+
+                for key in "model edit_format commit_hash editor_model editor_edit_format".split():
+                    val = results.get(key)
+                    if val:
+                        res.variants[key].add(val)
+
+                        
+                commit_hashes = res.variants["commit_hash"]
+                res.versions = get_versions(commit_hashes)
+
+                for i in range(tries):
+                    pass_rate = 100 * res.passed_tests[i] / res.completed_tests
+                    # console.print(f"{pass_rate:.1f}% correct after try {i + 1}")
+                    setattr(res, f"pass_rate_{i + 1}", f"{pass_rate:.1f}")
+                    setattr(res, f"pass_num_{i + 1}", res.passed_tests[i])
+
+
+    
+    if all([res.completed_tests == 0 for res in run_to_res.values()]):
+        return []
+
+
+    
+    def stats(objs: Iterable[Any], attr_name: str, TypeConversion: type | None = None, *, default: Any = None) -> str | list[str]:
+        if default is None:
+            nums = [getattr(obj, attr_name) for obj in objs if hasattr(obj, attr_name)]
+        else:
+            nums = [getattr(obj, attr_name) if hasattr(obj, attr_name) else default for obj in objs]
+
+        if TypeConversion is not None:
+            nums = [TypeConversion(num) for num in nums]
+
+        if len(nums) == 0:
+            return ""
+        elif len(nums) == 1:
+            return str(nums[0])
+        elif isinstance(nums[0], list):
+            # Compute stats of each item in list
+            max_len = max([len(num_list) for num_list in nums])
+            ret: list[str] = []
+            for i in range(max_len):
+                stats = [num_list[i] for num_list in nums if len(num_list) > i]
+                ret.append(format_stats(stats))
+
+            return ret
+        else:
+            return format_stats(nums)
+    
+    def format_stats(nums: list[float] | list[int]) -> str:
+        if len(nums) == 0:
+            return "-"
+        elif len(nums) == 1:
+            return f"{nums[0]}"
+
+        mean = statistics.mean(nums)
+        std_dev = statistics.stdev(nums)
+        return f"{mean:.2f} +/- {std_dev:.2f}"
+    
     console = Console(highlight=False)
     console.rule(title=str(dirname))
 
-    commit_hashes = variants["commit_hash"]
-    versions = get_versions(commit_hashes)
-    date = dirname.name[:10]
-
-    def show(stat, red="red"):
-        val = getattr(res, stat)
-        style = red if val else None
-        console.print(f"  {stat}: {val}", style=style)
-
-    percents = dict()
-    for i in range(tries):
-        pass_rate = 100 * passed_tests[i] / res.completed_tests
-        percents[i] = pass_rate
-        # console.print(f"{pass_rate:.1f}% correct after try {i + 1}")
-        setattr(res, f"pass_rate_{i + 1}", f"{pass_rate:.1f}")
-        setattr(res, f"pass_num_{i + 1}", passed_tests[i])
-
     print(f"- dirname: {dirname.name}")
-    style = None if res.completed_tests == res.total_tests else "red"
-    console.print(f"  test_cases: {res.completed_tests}", style=style)
-    for key, val in variants.items():
-        if len(val) > 1:
-            style = "red"
-        else:
-            style = None
-        val = ", ".join(map(str, val))
-        setattr(res, key, val)
-        console.print(f"  {key}: {val}", style=style)
+    style = None if all([res.completed_tests == res.total_tests for res in run_to_res.values()]) else "red"
+    console.print(f"  test_cases: {stats(run_to_res.values(), 'total_tests')}", style=style)
 
-    if res.reasoning_effort is not None:
-        print(f"  reasoning_effort: {res.reasoning_effort}")
-    if res.thinking_tokens is not None:
-        print(f"  thinking_tokens: {res.thinking_tokens}")
-    if res.map_tokens is not None:
-        print(f"  map_tokens: {res.map_tokens}")
+    if len(run_to_res) == 1:
+        # Only set and print the variants if this show_stats() refers to one run
+        res = list(run_to_res.values())[0]
+        for key, val in res.variants.items():
+            if len(val) > 1:
+                variant_style = "red"
+            else:
+                variant_style = None
+            val = ", ".join(map(str, val))
+            setattr(res, key, val)
+            console.print(f"  {key}: {val}", style=variant_style)
 
-    for i in range(tries):
-        print(f"  pass_rate_{i + 1}: {percents[i]:.1f}")
-    for i in range(tries):
-        print(f"  pass_num_{i + 1}: {passed_tests[i]}")
+        # Only print these stats if this show_stats() refers to one run
+        if res.reasoning_effort is not None:
+            print(f"  reasoning_effort: {res.reasoning_effort}")
+        if res.thinking_tokens is not None:
+            print(f"  thinking_tokens: {res.thinking_tokens}")
+        if res.map_tokens is not None:
+            print(f"  map_tokens: {res.map_tokens}")
+            
+    for i in range(max_tries):
+        print(f"  pass_rate_{i + 1}: {stats(run_to_res.values(), f'pass_rate_{i + 1}', float)}")
+    for i in range(max_tries):
+        print(f"  pass_num_{i + 1}: {stats(run_to_res.values(), f'pass_num_{i + 1}')}")
 
-    pct_well_formed = 1.0 - res.num_with_malformed_responses / res.completed_tests
-    print(f"  percent_cases_well_formed: {pct_well_formed * 100:.1f}")
+    pct_well_formed = [100 - 100 * res.num_with_malformed_responses / res.completed_tests for res in run_to_res.values()]
+    print(f"  percent_cases_well_formed: {format_stats(pct_well_formed)}")
 
-    show("error_outputs")
-    show("num_malformed_responses")
-    show("num_with_malformed_responses")
-    show("user_asks")
-    show("lazy_comments")
-    show("syntax_errors")
-    show("indentation_errors")
-    show("exhausted_context_windows")
-    show("prompt_tokens", red=None)
-    show("completion_tokens", red=None)
-    show("test_timeouts")
-    print(f"  total_tests: {res.total_tests}")
+    
+    def show(run_to_res: dict[str, Any], stat_name: str, red: str | None ="red"):
+        style = red if any([getattr(res, stat_name) for res in run_to_res.values()]) else None
+        console.print(f"  {stat_name}: {stats(run_to_res.values(), stat_name)}", style=style)
+        
+    show(run_to_res, "error_outputs")
+    show(run_to_res, "num_malformed_responses")
+    show(run_to_res, "num_with_malformed_responses")
+    show(run_to_res, "user_asks")
+    show(run_to_res, "lazy_comments")
+    show(run_to_res, "syntax_errors")
+    show(run_to_res, "indentation_errors")
+    show(run_to_res, "exhausted_context_windows")
+    show(run_to_res, "prompt_tokens", red=None)
+    show(run_to_res, "completion_tokens", red=None)
+    show(run_to_res, "test_timeouts")
+    print(f"  total_tests: {sum([res.total_tests for res in run_to_res.values()])}")
 
-    if variants["model"]:
-        a_model = set(variants["model"]).pop()
-        command = f"aider-ce --model {a_model}"
-        print(f"  command: {command}")
+    
+    if len(run_to_res) == 1:
+        # Only print the variants and date if this show_stats() refers to one run
+        res = list(run_to_res.values())[0]
+        
+        if res.variants["model"]:
+            a_model = set(res.variants["model"]).pop()
+            command = f"aider-ce --model {a_model}"
+            print(f"  command: {command}")
 
-    print(f"  date: {date}")
-    print("  versions:", ",".join(versions))
+        print(f"  date: {dirname.name[:10]}")
+        print("  versions:", ",".join(res.versions))
 
-    res.avg_duration = res.duration / res.completed_tests
-    print(f"  seconds_per_case: {res.avg_duration:.1f}")
+    [setattr(res, "avg_duration", res.duration / res.completed_tests) for res in run_to_res.values()]
+    print(f"  seconds_per_case: {stats(run_to_res.values(), 'avg_duration')}")
 
-    print(f"  total_cost: {res.cost:.4f}")
+    print(f"  total_cost: {stats(run_to_res.values(), 'cost')}")
 
-    res.avg_cost = res.cost / res.completed_tests
-
-    projected_cost = res.avg_cost * res.total_tests
+    [setattr(res, "avg_cost", res.cost / res.completed_tests) for res in run_to_res.values()]
+    [setattr(res, "projected_cost", res.avg_cost * res.total_tests) for res in run_to_res.values()]
 
     print()
     print(
-        f"costs: ${res.avg_cost:.4f}/test-case, ${res.cost:.2f} total,"
-        f" ${projected_cost:.2f} projected"
+        f"costs: ${stats(run_to_res.values(), 'avg_cost')}/test-case, ${stats(run_to_res.values(), 'cost')} total,"
+        f" ${stats(run_to_res.values(), 'projected_cost')} projected"
     )
 
-    if verbose and len(lang_to_stats) > 0:
+    if verbose and len(lang_to_run_to_stats) > 0:
+        def group_lang_stats(lang: str, run_to_lang_stats: dict[str, SimpleNamespace]) -> SimpleNamespace:
+            if len(run_to_lang_stats) == 0:
+                return SimpleNamespace()
+            
+            lang_stats = list(run_to_lang_stats.values())[0]
+            if len(run_to_lang_stats) == 1:
+                return format_lang_stats(lang, lang_stats)
 
-        def format_lang_stats(lang, lang_stats):
+            ret = SimpleNamespace()
+            for attr in lang_stats.__dict__:
+                val = stats(run_to_lang_stats.values(), attr)
+                setattr(ret, attr, val)
+
+            return ret
+            
+                
+        def format_lang_stats(lang: str, lang_stats: SimpleNamespace) -> SimpleNamespace:
             # First, postprocess attributes for easier printing
-            if lang_stats.completed_tests > 0:
-                lang_stats.avg_duration_per_test = lang_stats.duration / float(
-                    lang_stats.completed_tests
+            ret = copy.deepcopy(lang_stats)
+            if ret.completed_tests > 0:
+                ret.avg_duration_per_test = ret.duration / float(
+                    ret.completed_tests
                 )
-            for i in range(tries):
-                num_passed = lang_to_passed_tests[lang][i]
-                setattr(lang_stats, f"pass_num_{i + 1}", num_passed)
-                pass_rate = 100 * num_passed / float(lang_stats.completed_tests)
-                setattr(lang_stats, f"pass_rate_{i + 1}", pass_rate)
+            for i in range(max_tries):
+                num_passed = ret.lang_to_passed_tests[i]
+                setattr(ret, f"pass_num_{i + 1}", num_passed)
+                pass_rate = 100 * num_passed / float(ret.completed_tests)
+                setattr(ret, f"pass_rate_{i + 1}", pass_rate)
 
             # Then format attributes into ready-to-print strings
-            for attr in lang_stats.__dict__:
-                val = getattr(lang_stats, attr)
+            for attr in ret.__dict__:
+                val = getattr(ret, attr)
                 if val == 0:
                     val = "-"
                 elif isinstance(val, float):
@@ -727,9 +800,11 @@ def summarize_results(dirname, verbose, stats_languages=None):
                 else:
                     val = f"{val:,}"
 
-                setattr(lang_stats, attr, val)
+                setattr(ret, attr, val)
 
-        def compute_lang_to_col_widths(lang_to_stats):
+            return ret
+
+        def compute_lang_to_col_widths(lang_to_stats: dict[str, SimpleNamespace]) -> dict[str, int]:
             lang_to_col_widths = {}
             for lang, lang_stats in lang_to_stats.items():
                 lang_stat_attrs = [getattr(lang_stats, attr) for attr in lang_stats.__dict__]
@@ -738,17 +813,18 @@ def summarize_results(dirname, verbose, stats_languages=None):
 
             return lang_to_col_widths
 
+        
         print()
         print("======== Stats by language ========")
         print()
 
-        [format_lang_stats(lang, lang_stats) for lang, lang_stats in lang_to_stats.items()]
-        lang_to_col_widths = compute_lang_to_col_widths(lang_to_stats)
+        lang_to_grouped_stats = {lang: group_lang_stats(lang, run_to_lang_stats) for lang, run_to_lang_stats in lang_to_run_to_stats.items()}
+        lang_to_col_widths = compute_lang_to_col_widths(lang_to_grouped_stats)
 
-        any_stats = list(lang_to_stats.values())[0]
-        attrs = list(any_stats.__dict__)
+        any_grouped_stats = list(lang_to_grouped_stats.values())[0]
+        attrs = list(any_grouped_stats.__dict__)
         attr_col_width = len(max(["language"] + attrs, key=len))
-        langs = list(lang_to_stats.keys())
+        langs = list(lang_to_grouped_stats.keys())
 
         print("| " + ("-" * attr_col_width), end="")
         for lang in langs:
@@ -771,9 +847,15 @@ def summarize_results(dirname, verbose, stats_languages=None):
         for attr in attrs:
             print(f"| {attr:<{attr_col_width}}", end="")
             for lang in langs:
-                lang_stats = lang_to_stats[lang]
+                grouped_lang_stats = lang_to_grouped_stats[lang]
                 col_width = lang_to_col_widths[lang]
-                print(f" | {getattr(lang_stats, attr):>{col_width}}", end="")
+
+                val = getattr(grouped_lang_stats, attr)
+                if not isinstance(val, str):
+                    # Skip printing the try_to_num_passed array here, as it is printed elsewhere
+                    continue
+                
+                print(f" | {getattr(grouped_lang_stats, attr):>{col_width}}", end="")
             print(" |")
 
         print("| " + ("-" * attr_col_width), end="")
@@ -786,7 +868,7 @@ def summarize_results(dirname, verbose, stats_languages=None):
     console.rule()
 
     # print(json.dumps(vars(res), indent=4, sort_keys=True))
-    return res
+    return list(run_to_res.values())
 
 
 def get_versions(commit_hashes):
