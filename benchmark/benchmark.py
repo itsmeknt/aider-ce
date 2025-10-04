@@ -645,7 +645,7 @@ def summarize_results(dirname, verbose, stats_languages=None):
 
 
     
-    def stats(objs: Iterable[Any], attr_name: str, TypeConversion: type | None = None, *, default: Any = None) -> str | list[str]:
+    def stats(objs: Iterable[Any], attr_name: str, TypeConversion: type | None = None, *, default: Any = None, detailed: bool = True) -> str | list[str]:
         if default is None:
             nums = [getattr(obj, attr_name) for obj in objs if hasattr(obj, attr_name)]
         else:
@@ -656,36 +656,50 @@ def summarize_results(dirname, verbose, stats_languages=None):
 
         if len(nums) == 0:
             return ""
-        elif len(nums) == 1:
-            return str(nums[0])
         elif isinstance(nums[0], list):
             # Compute stats of each item in list
             max_len = max([len(num_list) for num_list in nums])
             ret: list[str] = []
             for i in range(max_len):
                 stats = [num_list[i] for num_list in nums if len(num_list) > i]
-                ret.append(format_stats(stats))
+                ret.append(format_stats(stats, detailed=detailed))
 
             return ret
         else:
-            return format_stats(nums)
+            return format_stats(nums, detailed=detailed)
     
-    def format_stats(nums: list[float] | list[int]) -> str:
+    def format_stats(nums: list[float] | list[int], *, detailed: bool = True) -> str:
         if len(nums) == 0:
             return "-"
         elif len(nums) == 1:
-            return f"{nums[0]}"
+            return format_num(nums[0])
 
         mean = statistics.mean(nums)
         std_dev = statistics.stdev(nums)
-        return f"{mean:.2f} +/- {std_dev:.2f}"
-    
+        stats = f"{format_num(mean)} ± {format_num(std_dev)}"
+        if detailed:
+            stats += f" ∈ [{format_num(min(nums))}, {format_num(max(nums))}]"
+
+        return stats
+
+    def format_num(num: float | int) -> str:
+        if num > 1_000_000_000:
+            return f"{(num/1_000_000_000):,.3g}b"
+        elif num > 1_000_000:
+            return f"{(num/1_000_000):,.3g}k"
+        elif num > 1_000:
+            return f"{(num/1_000):,.3g}k"
+        else:
+            return f"{num:,.3g}"
+            
     console = Console(highlight=False)
     console.rule(title=str(dirname))
 
     print(f"- dirname: {dirname.name}")
+    if len(run_to_res) > 1:
+        print(f"  total_runs: {len(run_to_res)}")
     style = None if all([res.completed_tests == res.total_tests for res in run_to_res.values()]) else "red"
-    console.print(f"  test_cases: {stats(run_to_res.values(), 'total_tests')}", style=style)
+    console.print(f"  test_cases: {stats(run_to_res.values(), 'completed_tests')}", style=style)
 
     if len(run_to_res) == 1:
         # Only set and print the variants if this show_stats() refers to one run
@@ -731,8 +745,8 @@ def summarize_results(dirname, verbose, stats_languages=None):
     show(run_to_res, "prompt_tokens", red=None)
     show(run_to_res, "completion_tokens", red=None)
     show(run_to_res, "test_timeouts")
-    print(f"  total_tests: {sum([res.total_tests for res in run_to_res.values()])}")
-
+    print(f"  total_tests: {stats(run_to_res.values(), 'total_tests')}")
+    print(f"  total_duration: {stats(run_to_res.values(), 'duration')}")
     
     if len(run_to_res) == 1:
         # Only print the variants and date if this show_stats() refers to one run
@@ -764,42 +778,23 @@ def summarize_results(dirname, verbose, stats_languages=None):
         def group_lang_stats(lang: str, run_to_lang_stats: dict[str, SimpleNamespace]) -> SimpleNamespace:
             if len(run_to_lang_stats) == 0:
                 return SimpleNamespace()
-            
-            lang_stats = list(run_to_lang_stats.values())[0]
-            if len(run_to_lang_stats) == 1:
-                return format_lang_stats(lang, lang_stats)
 
+            # Add derived stats
+            for lang_stats in run_to_lang_stats.values():
+                if lang_stats.completed_tests > 0:
+                    lang_stats.avg_duration_per_test = lang_stats.duration / float(
+                        lang_stats.completed_tests
+                    )
+                for i in range(max_tries):
+                    num_passed = lang_stats.lang_to_passed_tests[i]
+                    setattr(lang_stats, f"pass_num_{i + 1}", num_passed)
+                    pass_rate = 100 * num_passed / float(lang_stats.completed_tests)
+                    setattr(lang_stats, f"pass_rate_{i + 1}", pass_rate)
+            
+            first_lang_stats = list(run_to_lang_stats.values())[0]
             ret = SimpleNamespace()
-            for attr in lang_stats.__dict__:
-                val = stats(run_to_lang_stats.values(), attr)
-                setattr(ret, attr, val)
-
-            return ret
-            
-                
-        def format_lang_stats(lang: str, lang_stats: SimpleNamespace) -> SimpleNamespace:
-            # First, postprocess attributes for easier printing
-            ret = copy.deepcopy(lang_stats)
-            if ret.completed_tests > 0:
-                ret.avg_duration_per_test = ret.duration / float(
-                    ret.completed_tests
-                )
-            for i in range(max_tries):
-                num_passed = ret.lang_to_passed_tests[i]
-                setattr(ret, f"pass_num_{i + 1}", num_passed)
-                pass_rate = 100 * num_passed / float(ret.completed_tests)
-                setattr(ret, f"pass_rate_{i + 1}", pass_rate)
-
-            # Then format attributes into ready-to-print strings
-            for attr in ret.__dict__:
-                val = getattr(ret, attr)
-                if val == 0:
-                    val = "-"
-                elif isinstance(val, float):
-                    val = f"{val:,.2f}"
-                else:
-                    val = f"{val:,}"
-
+            for attr in first_lang_stats.__dict__:
+                val = stats(run_to_lang_stats.values(), attr, detailed=True)
                 setattr(ret, attr, val)
 
             return ret
@@ -817,7 +812,7 @@ def summarize_results(dirname, verbose, stats_languages=None):
         print()
         print("======== Stats by language ========")
         print()
-
+        
         lang_to_grouped_stats = {lang: group_lang_stats(lang, run_to_lang_stats) for lang, run_to_lang_stats in lang_to_run_to_stats.items()}
         lang_to_col_widths = compute_lang_to_col_widths(lang_to_grouped_stats)
 
@@ -826,44 +821,57 @@ def summarize_results(dirname, verbose, stats_languages=None):
         attr_col_width = len(max(["language"] + attrs, key=len))
         langs = list(lang_to_grouped_stats.keys())
 
-        print("| " + ("-" * attr_col_width), end="")
-        for lang in langs:
-            col_width = lang_to_col_widths[lang]
-            print(" | " + ("-" * col_width), end="")
-        print(" |")
-
-        print(f"| {' '.center(attr_col_width)}", end="")
-        for lang in langs:
-            col_width = lang_to_col_widths[lang]
-            print(f" | {lang.center(col_width)}", end="")
-        print(" |")
-
-        print("| " + ("-" * attr_col_width), end="")
-        for lang in langs:
-            col_width = lang_to_col_widths[lang]
-            print(" | " + ("-" * col_width), end="")
-        print(" |")
-
-        for attr in attrs:
-            print(f"| {attr:<{attr_col_width}}", end="")
-            for lang in langs:
-                grouped_lang_stats = lang_to_grouped_stats[lang]
+        MAX_LANG_PER_ROW = 9 if len(run_to_lang_to_results) == 1 else 3
+        for i in range(0, len(langs), MAX_LANG_PER_ROW):
+            # Header top border
+            print("| " + ("-" * attr_col_width), end="")
+            for j in range(0, min(len(langs), MAX_LANG_PER_ROW)):
+                lang = langs[i + j]
                 col_width = lang_to_col_widths[lang]
-
-                val = getattr(grouped_lang_stats, attr)
-                if not isinstance(val, str):
-                    # Skip printing the try_to_num_passed array here, as it is printed elsewhere
-                    continue
-                
-                print(f" | {getattr(grouped_lang_stats, attr):>{col_width}}", end="")
+                print(" | " + ("-" * col_width), end="")
             print(" |")
 
-        print("| " + ("-" * attr_col_width), end="")
-        for lang in langs:
-            col_width = lang_to_col_widths[lang]
-            print(" | " + ("-" * col_width), end="")
-        print(" |")
-        print()
+            # Header language
+            print(f"| {' '.center(attr_col_width)}", end="")
+            for j in range(0, min(len(langs), MAX_LANG_PER_ROW)):
+                lang = langs[i + j]
+                col_width = lang_to_col_widths[lang]
+                print(f" | {lang.center(col_width)}", end="")
+            print(" |")
+
+            # Header bottom border
+            print("| " + ("-" * attr_col_width), end="")
+            for j in range(0, min(len(langs), MAX_LANG_PER_ROW)):
+                lang = langs[i + j]
+                col_width = lang_to_col_widths[lang]
+                print(" | " + ("-" * col_width), end="")
+            print(" |")
+
+            # Row data
+            for attr in attrs:
+                print(f"| {attr:<{attr_col_width}}", end="")
+                for j in range(0, min(len(langs), MAX_LANG_PER_ROW)):
+                    lang = langs[i + j]
+                    grouped_lang_stats = lang_to_grouped_stats[lang]
+                    col_width = lang_to_col_widths[lang]
+
+                    val = getattr(grouped_lang_stats, attr)
+                    if not isinstance(val, str):
+                        # Skip printing the try_to_num_passed array here, as it is printed elsewhere
+                        continue
+
+                    print(f" | {getattr(grouped_lang_stats, attr):>{col_width}}", end="")
+                print(" |")
+
+            # Table bottom border
+            print("| " + ("-" * attr_col_width), end="")
+            for j in range(0, min(len(langs), MAX_LANG_PER_ROW)):
+                lang = langs[i + j]
+                col_width = lang_to_col_widths[lang]
+                print(" | " + ("-" * col_width), end="")
+            print(" |")
+            print()
+            print()
 
     console.rule()
 
