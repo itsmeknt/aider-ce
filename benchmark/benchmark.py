@@ -874,8 +874,9 @@ def summarize_results(dirname, verbose, stats_languages=None):
 
             row = [testcase, format_num(num_attempts), format_num(100*overall_pass_rate), f"[{', '.join([format_num(100*rate) for rate in pass_rate_by_tries])}]", format_num(mean_errors), format_num(mean_duration), format_num(mean_prompt_tokens), format_num(mean_completion_tokens)]
             table_rows.append(row)
-            testcase_to_sort_score[testcase] = 1_000_000_000 * overall_pass_rate + 10_000_000 * num_attempts + 10_000 * mean_errors + mean_duration
+            testcase_to_sort_score[testcase] = overall_pass_rate
 
+        table_rows.sort(key=lambda row: row[0])
         table_rows.sort(key=lambda row: testcase_to_sort_score[row[0]])
         print(format_table(table_header, table_rows))
         print()
