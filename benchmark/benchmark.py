@@ -475,6 +475,7 @@ def show_diffs(dirnames):
 def load_results(dirname, stats_languages=None):
     dirname = Path(dirname)
     run_to_lang_to_results = {}
+    testcase_to_run_to_stats = {}
 
     if stats_languages:
         languages = [lang.strip().lower() for lang in stats_languages.split(",")]
@@ -491,11 +492,13 @@ def load_results(dirname, stats_languages=None):
                 lang = fname.parent.parent.parent.parent.name
                 run =  fname.parent.parent.parent.parent.parent.relative_to(dirname)
                 run_to_lang_to_results.setdefault(run, {}).setdefault(lang, []).append(results)
+
+                testcase_to_run_to_stats.setdefault(results["testcase"], {})[run] = results
             except json.JSONDecodeError:
                 print("json.JSONDecodeError", fname)
                 continue
             
-    return run_to_lang_to_results
+    return run_to_lang_to_results, testcase_to_run_to_stats
 
 
 def summarize_results(dirname, verbose, stats_languages=None):
@@ -506,7 +509,7 @@ def summarize_results(dirname, verbose, stats_languages=None):
         lang_prev = getattr(lang_stats, attr_name)
         setattr(lang_stats, attr_name, lang_prev + increment)
             
-    run_to_lang_to_results = load_results(dirname, stats_languages)
+    run_to_lang_to_results, testcase_to_run_to_stats = load_results(dirname, stats_languages)
 
 
     max_tries = 0
@@ -654,10 +657,13 @@ def summarize_results(dirname, verbose, stats_languages=None):
         if TypeConversion is not None:
             nums = [TypeConversion(num) for num in nums]
 
+        return format_stats(nums, detailed=detailed)
+    
+    def format_stats(nums: list[float] | list[int] | list[list[float]] | list[list[int]], *, detailed: bool = True) -> str | list[str]:
         if len(nums) == 0:
-            return ""
+            return "-"
         elif isinstance(nums[0], list):
-            # Compute stats of each item in list
+            # Compute statsx of each item in list
             max_len = max([len(num_list) for num_list in nums])
             ret: list[str] = []
             for i in range(max_len):
@@ -665,12 +671,6 @@ def summarize_results(dirname, verbose, stats_languages=None):
                 ret.append(format_stats(stats, detailed=detailed))
 
             return ret
-        else:
-            return format_stats(nums, detailed=detailed)
-    
-    def format_stats(nums: list[float] | list[int], *, detailed: bool = True) -> str:
-        if len(nums) == 0:
-            return "-"
         elif len(nums) == 1:
             return format_num(nums[0])
 
@@ -814,70 +814,117 @@ def summarize_results(dirname, verbose, stats_languages=None):
         print()
         
         lang_to_grouped_stats = {lang: group_lang_stats(lang, run_to_lang_stats) for lang, run_to_lang_stats in lang_to_run_to_stats.items()}
-        lang_to_col_widths = compute_lang_to_col_widths(lang_to_grouped_stats)
+        langs = list(lang_to_grouped_stats.keys())
 
         any_grouped_stats = list(lang_to_grouped_stats.values())[0]
         attrs = list(any_grouped_stats.__dict__)
-        attr_col_width = len(max(["language"] + attrs, key=len))
-        langs = list(lang_to_grouped_stats.keys())
 
         MAX_LANG_PER_ROW = 9 if len(run_to_lang_to_results) == 1 else 3
         for i in range(0, len(langs), MAX_LANG_PER_ROW):
-            # Header top border
-            print("| " + ("-" * attr_col_width), end="")
+            table_header = [""]
             for j in range(0, min(len(langs), MAX_LANG_PER_ROW)):
-                lang = langs[i + j]
-                col_width = lang_to_col_widths[lang]
-                print(" | " + ("-" * col_width), end="")
-            print(" |")
+                 table_header.append(langs[i + j])
 
-            # Header language
-            print(f"| {' '.center(attr_col_width)}", end="")
-            for j in range(0, min(len(langs), MAX_LANG_PER_ROW)):
-                lang = langs[i + j]
-                col_width = lang_to_col_widths[lang]
-                print(f" | {lang.center(col_width)}", end="")
-            print(" |")
-
-            # Header bottom border
-            print("| " + ("-" * attr_col_width), end="")
-            for j in range(0, min(len(langs), MAX_LANG_PER_ROW)):
-                lang = langs[i + j]
-                col_width = lang_to_col_widths[lang]
-                print(" | " + ("-" * col_width), end="")
-            print(" |")
-
-            # Row data
+            table_rows = []
             for attr in attrs:
-                print(f"| {attr:<{attr_col_width}}", end="")
+                if not isinstance(getattr(any_grouped_stats, attr), str):
+                    # Skip printing the try_to_num_passed array here, as it is printed elsewhere
+                    continue
+                
+                row = [attr]
                 for j in range(0, min(len(langs), MAX_LANG_PER_ROW)):
-                    lang = langs[i + j]
-                    grouped_lang_stats = lang_to_grouped_stats[lang]
-                    col_width = lang_to_col_widths[lang]
-
+                    grouped_lang_stats = lang_to_grouped_stats[langs[i + j]]
                     val = getattr(grouped_lang_stats, attr)
-                    if not isinstance(val, str):
-                        # Skip printing the try_to_num_passed array here, as it is printed elsewhere
-                        continue
+                    row.append(val)
 
-                    print(f" | {getattr(grouped_lang_stats, attr):>{col_width}}", end="")
-                print(" |")
+                table_rows.append(row)
 
-            # Table bottom border
-            print("| " + ("-" * attr_col_width), end="")
-            for j in range(0, min(len(langs), MAX_LANG_PER_ROW)):
-                lang = langs[i + j]
-                col_width = lang_to_col_widths[lang]
-                print(" | " + ("-" * col_width), end="")
-            print(" |")
+            print(format_table(table_header, table_rows))
             print()
             print()
+
+        print()
+        print("======== Stats by testcase ========")
+        print()
+
+        testcase_to_sort_score = {}
+        table_header = ["testcase", "num_attempts", "pass_rate", "pass_rate_by_try", "mean_error_outputs", "mean_duration", "mean_prompt_tokens", "mean_completion_tokens"]
+        table_rows = []
+        for testcase, run_to_stats in testcase_to_run_to_stats.items():
+            curr_max_tries = max([len(stats["tests_outcomes"]) for stats in run_to_stats.values()])
+            num_correct_by_tries = []
+            num_attempts_by_tries = []
+            for curr_try in range(curr_max_tries):
+                num_attempts = sum([1 if len(stats["tests_outcomes"]) > curr_try else 0 for stats in run_to_stats.values()])
+                if num_attempts == 0:
+                    continue
+                
+                num_attempts_by_tries.append(num_attempts)
+                
+                num_correct = sum([1 if len(stats["tests_outcomes"]) > curr_try and stats["tests_outcomes"][curr_try] else 0 for stats in run_to_stats.values()])
+                num_correct_by_tries.append(num_correct)
+                
+            pass_rate_by_tries = [float(num_correct_by_tries[i])/num_attempts_by_tries[i] for i in range(len(num_attempts_by_tries))]
+            mean_errors = statistics.mean([stats["num_error_outputs"] for stats in run_to_stats.values()])
+            mean_duration = statistics.mean([stats["duration"] for stats in run_to_stats.values()])
+            mean_prompt_tokens = statistics.mean([stats["prompt_tokens"] for stats in run_to_stats.values()])
+            mean_completion_tokens = statistics.mean([stats["completion_tokens"] for stats in run_to_stats.values()])
+            overall_pass_rate = max(pass_rate_by_tries)
+            num_attempts = max(num_attempts_by_tries)
+
+            row = [testcase, format_num(num_attempts), format_num(100*overall_pass_rate), f"[{', '.join([format_num(100*rate) for rate in pass_rate_by_tries])}]", format_num(mean_errors), format_num(mean_duration), format_num(mean_prompt_tokens), format_num(mean_completion_tokens)]
+            table_rows.append(row)
+            testcase_to_sort_score[testcase] = 1_000_000_000 * overall_pass_rate + 10_000_000 * num_attempts + 10_000 * mean_errors + mean_duration
+
+        table_rows.sort(key=lambda row: testcase_to_sort_score[row[0]])
+        print(format_table(table_header, table_rows))
+        print()
+        print()
 
     console.rule()
 
     # print(json.dumps(vars(res), indent=4, sort_keys=True))
     return list(run_to_res.values())
 
+
+def format_table(headers: list[str], rows: list[list[str]]) -> str:
+    col_widths: list[int] = []
+    for i in range(len(headers)):
+        all_values = [headers[i]] + [row[i] for row in rows]
+        col_width = max([len(value) for value in all_values])
+        col_widths.append(col_width)
+
+    border_row = [None] * len(col_widths)
+
+    table_lines = [format_table_row(border_row, col_widths),
+                   format_table_row(headers, col_widths, is_header=True),
+                   format_table_row(border_row, col_widths)]
+
+    for row in rows:
+        table_lines.append(format_table_row(row, col_widths))
+
+    table_lines.append(format_table_row(border_row, col_widths))
+    return "\n".join(table_lines)
+    
+
+def format_table_row(row: list[str] | list[None], col_widths: list[int], *, is_header: bool = False) -> str:
+    ret = ""
+    for i in range(len(col_widths)):
+        if i == 0:
+            ret += "| "
+        else:
+            ret += " | "
+            
+        cell = row[i]
+        if cell is None:
+            ret += "-" * col_widths[i]
+        elif is_header:
+            ret += cell.center(col_widths[i])
+        else:
+            ret += f"{cell:<{col_widths[i]}}"
+
+    ret += " |"
+    return ret
 
 def get_versions(commit_hashes):
     versions = set()
